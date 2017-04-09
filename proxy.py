@@ -1,3 +1,5 @@
+import base64
+import copy
 import thread
 import socket
 import sys
@@ -12,7 +14,10 @@ import email.utils as eut
 max_connections = 10
 BUFFER_SIZE = 4096
 CACHE_DIR = "./cache"
-
+BLACKLIST_FILE = "blacklist.txt"
+USERNAME_PASSWORD_FILE = "username_password.txt"
+blocked = []
+admins = []
 
 # take command line argument
 if len(sys.argv) != 2:
@@ -28,6 +33,30 @@ except:
 
 if not os.path.isdir(CACHE_DIR):
     os.makedirs(CACHE_DIR)
+
+f = open(BLACKLIST_FILE, "rb")
+data = ""
+while True:
+    chunk = f.read()
+    if not len(chunk):
+        break
+    data += chunk
+f.close()
+blocked = data.splitlines()
+
+f = open(USERNAME_PASSWORD_FILE, "rb")
+data = ""
+while True:
+    chunk = f.read()
+    if not len(chunk):
+        break
+    data += chunk
+f.close()
+data = data.splitlines()
+for d in data:
+    admins.append(base64.b64encode(d))
+
+print admins
 
 
 # lock fileurl
@@ -124,6 +153,14 @@ def parse_details(client_addr, client_data):
             server_port = int(url[(port_pos+1):path_pos])
             server_url = url[:port_pos]
 
+        # check for auth
+        print lines
+        auth_line = [ line for line in lines if "Authorization" in line]
+        if len(auth_line):
+            auth_b64 = auth_line[0].split()[2]
+        else:
+            auth_b64 = None
+
         # build up request for server
         first_line_tokens[1] = url[path_pos:]
         lines[0] = ' '.join(first_line_tokens)
@@ -136,6 +173,7 @@ def parse_details(client_addr, client_data):
             "client_data" : client_data,
             "protocol" : protocol,
             "method" : first_line_tokens[0],
+            "auth_b64" : auth_b64,
         }
 
     except Exception as e:
@@ -156,6 +194,7 @@ def get_cache_details(client_addr, details):
     return details
 
 
+# insert the header
 def insert_if_modified(details):
 
     lines = details["client_data"].splitlines()
@@ -167,7 +206,7 @@ def insert_if_modified(details):
     header = "If-Modified-Since: " + header
     lines.append(header)
 
-    details["client_data"] = "\r\n".join(lines) + '\r\n\r\n'
+    details["client_data"] = "\r\n".join(lines) + "\r\n\r\n"
     return details
 
 
@@ -186,7 +225,7 @@ def serve_get(client_socket, client_addr, details):
         reply = server_socket.recv(BUFFER_SIZE)
         if last_mtime and "304 Not Modified" in reply:
             print "returning cached file %s to %s" % (cache_path, str(client_addr))
-            f = open(cache_path, 'r')
+            f = open(cache_path, 'rb')
             chunk = f.read(BUFFER_SIZE)
             while chunk:
                 client_socket.send(chunk)
@@ -197,11 +236,14 @@ def serve_get(client_socket, client_addr, details):
             if do_cache:
                 print "caching file while serving %s to %s" % (cache_path, str(client_addr))
                 f = open(cache_path, "w+")
+                print len(reply), reply
                 while len(reply):
                     client_socket.send(reply)
                     f.write(reply)
                     reply = server_socket.recv(BUFFER_SIZE)
+                    print len(reply), reply
                 f.close()
+                client_socket.send("\r\n\r\n")
             else:
                 print "without caching serving %s to %s" % (cache_path, str(client_addr))
                 #print len(reply), reply
@@ -209,6 +251,7 @@ def serve_get(client_socket, client_addr, details):
                     client_socket.send(reply)
                     reply = server_socket.recv(BUFFER_SIZE)
                     #print len(reply), reply
+                client_socket.send("\r\n\r\n")
 
         server_socket.close()
         client_socket.close()
@@ -245,6 +288,17 @@ def serve_post(client_socket, client_addr, details):
         return
 
 
+def is_blocked(client_socket, client_addr, details):
+
+    if not (details["server_url"] + ":" + str(details["server_port"])) in blocked:
+        return False
+    if not details["auth_b64"]:
+        return True
+    if details["auth_b64"] in admins:
+        return False
+    return True
+
+
 
 # A thread function to handle one request
 def handle_one_request_(client_socket, client_addr, client_data):
@@ -256,7 +310,17 @@ def handle_one_request_(client_socket, client_addr, client_data):
         client_socket.close()
         return
 
-    if details["method"] == "GET":
+    isb = is_blocked(client_socket, client_addr, details)
+    print "Block status : ", isb
+
+    if isb:
+        client_socket.send("HTTP/1.0 200 OK\r\n")
+        client_socket.send("Content-Length: 11\r\n")
+        client_socket.send("\r\n")
+        client_socket.send("Error\r\n")
+        client_socket.send("\r\n\r\n")
+
+    elif details["method"] == "GET":
         details = get_cache_details(client_addr, details)
         if details["last_mtime"]:
             details = insert_if_modified(details)
@@ -265,6 +329,7 @@ def handle_one_request_(client_socket, client_addr, client_data):
     elif details["method"] == "POST":
         serve_post(client_socket, client_addr, details)
 
+    client_socket.close()
     print client_addr, "closed"
 
 
@@ -277,6 +342,7 @@ def start_proxy_server():
     # Initialize socket
     try:
         proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         proxy_socket.bind(('', proxy_port))
         proxy_socket.listen(max_connections)
 
@@ -304,7 +370,14 @@ def start_proxy_server():
                 client_data.splitlines()[0]
                 )
 
-            thread.start_new_thread(handle_one_request_, (client_socket, client_addr, client_data))
+            thread.start_new_thread(
+                handle_one_request_,
+                (
+                    client_socket,
+                    client_addr,
+                    client_data
+                )
+            )
 
         except KeyboardInterrupt:
             client_socket.close()
