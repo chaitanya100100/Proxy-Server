@@ -3,6 +3,7 @@ import socket
 import sys
 import os
 import datetime
+import json
 
 
 # global variables
@@ -79,6 +80,7 @@ def serve(client_socket, client_addr, details):
             reply = server_socket.recv(BUFFER_SIZE)
             if len(reply):
                 client_socket.send(reply)
+                #print "data : %s" % reply
             else:
                 break
 
