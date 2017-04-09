@@ -14,9 +14,10 @@ class HTTPCacheRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
     def send_head(self):
         if self.command != "POST" and self.headers.get('If-Modified-Since', None):
             filename = self.path.strip("/")
+            print filename
             if os.path.isfile(filename):
                 a = time.strptime(time.ctime(os.path.getmtime(filename)), "%a %b %d %H:%M:%S %Y")
-                b = time.strptime(self.headers.get('If-Modified-Since', None), "%a %b  %d %H:%M:%S %Z %Y")
+                b = time.strptime(self.headers.get('If-Modified-Since', None), "%a %b %d %H:%M:%S %Y")
                 if a < b:
                     self.send_response(304)
                     self.end_headers()

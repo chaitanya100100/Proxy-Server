@@ -3,12 +3,15 @@ import socket
 import sys
 import os
 import datetime
+import time
 import json
-
+import threading
+import email.utils as eut
 
 # global variables
 max_connections = 10
 BUFFER_SIZE = 4096
+CACHE_DIR = "./cache"
 
 
 # take command line argument
@@ -23,14 +26,81 @@ except:
     print "provide proper port number"
     raise SystemExit
 
+if not os.path.isdir(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+
+
+# lock fileurl
+def get_access(fileurl):
+    if fileurl in locks:
+        lock = locks[fileurl]
+    else:
+        lock = threading.Lock()
+        locks[fileurl] = lock
+    lock.acquire()
+
+# unlock fileurl
+def leave_access(fileurl):
+    if fileurl in locks:
+        lock = locks[fileurl]
+        lock.release()
+    else:
+        print "Lock problem"
+        sys.exit()
+
+
+# add fileurl entry to log
+def add_log(fileurl, client_addr):
+    if not fileurl in logs:
+        logs[fileurl] = []
+    dt = time.strptime(time.ctime(), "%a %b %d %H:%M:%S %Y")
+    logs[fileurl].append({
+            "datetime" : dt,
+            "client" : json.dumps(client_addr),
+        })
+    #print logs[fileurl]
+
+# decide whether to cache or not
+def do_cache_or_not(fileurl):
+    try:
+        log_arr = logs[fileurl]
+        if len(log_arr) < 3 : return False
+        last_third = log_arr[len(log_arr)-3]["datetime"]
+        if datetime.datetime.fromtimestamp(time.mktime(last_third)) + datetime.timedelta(minutes=10) >= datetime.datetime.now():
+            return True
+        else:
+            return False
+    except Exception as e:
+        print e
+        return False
+
+# check whether file is already cached or not
+def get_current_cache_info(fileurl):
+
+    if fileurl.startswith("/"):
+        fileurl = fileurl.replace("/", "", 1)
+
+    cache_path = CACHE_DIR + "/" + fileurl.replace("/", "__")
+
+    if os.path.isfile(cache_path):
+        last_mtime = time.strptime(time.ctime(os.path.getmtime(cache_path)), "%a %b %d %H:%M:%S %Y")
+        return cache_path, last_mtime
+    else:
+        return cache_path, None
 
 # returns a dictionary of details
 def parse_details(client_addr, client_data):
     try:
+        # parse first line like below
+        # http:://127.0.0.1:20020/1.data
+
         lines = client_data.splitlines()
+        while lines[len(lines)-1] == '':
+            lines.remove('')
         first_line_tokens = lines[0].split()
         url = first_line_tokens[1]
 
+        # get starting index of IP
         url_pos = url.find("://")
         if url_pos != -1:
             protocol = url[:url_pos]
@@ -38,12 +108,15 @@ def parse_details(client_addr, client_data):
         else:
             protocol = "http"
 
+        # get port if any
+        # get url path
         port_pos = url.find(":")
         path_pos = url.find("/")
         if path_pos == -1:
             path_pos = len(url)
 
 
+        # change request path accordingly
         if port_pos==-1 or path_pos < port_pos:
             server_port = 80
             server_url = url[:path_pos]
@@ -51,6 +124,7 @@ def parse_details(client_addr, client_data):
             server_port = int(url[(port_pos+1):path_pos])
             server_url = url[:port_pos]
 
+        # build up request for server
         first_line_tokens[1] = url[path_pos:]
         lines[0] = ' '.join(first_line_tokens)
         client_data = "\r\n".join(lines) + '\r\n\r\n'
@@ -58,8 +132,10 @@ def parse_details(client_addr, client_data):
         return {
             "server_port" : server_port,
             "server_url" : server_url,
+            "total_url" : url,
             "client_data" : client_data,
             "protocol" : protocol,
+            "method" : first_line_tokens[0],
         }
 
     except Exception as e:
@@ -67,20 +143,94 @@ def parse_details(client_addr, client_data):
         print
         return None
 
+# collect all cache info
+def get_cache_details(client_addr, details):
+    get_access(details["total_url"])
+    add_log(details["total_url"], client_addr)
+    do_cache = do_cache_or_not(details["total_url"])
+    cache_path, last_mtime = get_current_cache_info(details["total_url"])
+    leave_access(details["total_url"])
+    details["do_cache"] = do_cache
+    details["cache_path"] = cache_path
+    details["last_mtime"] = last_mtime
+    return details
 
-# get the response from server and give it to client
-def serve(client_socket, client_addr, details):
+
+def insert_if_modified(details):
+
+    lines = details["client_data"].splitlines()
+    while lines[len(lines)-1] == '':
+        lines.remove('')
+
+    #header = "If-Modified-Since: " + time.strptime("%a %b %d %H:%M:%S %Y", details["last_mtime"])
+    header = time.strftime("%a %b %d %H:%M:%S %Y", details["last_mtime"])
+    header = "If-Modified-Since: " + header
+    lines.append(header)
+
+    details["client_data"] = "\r\n".join(lines) + '\r\n\r\n'
+    return details
+
+
+def serve_get(client_socket, client_addr, details):
+    try:
+        #print details["client_data"], details["do_cache"], details["cache_path"], details["last_mtime"]
+        client_data = details["client_data"]
+        do_cache = details["do_cache"]
+        cache_path = details["cache_path"]
+        last_mtime = details["last_mtime"]
+
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.connect((details["server_url"], details["server_port"]))
+        server_socket.send(details["client_data"])
+
+        reply = server_socket.recv(BUFFER_SIZE)
+        if last_mtime and "304 Not Modified" in reply:
+            print "returning cached file %s to %s" % (cache_path, str(client_addr))
+            f = open(cache_path, 'r')
+            chunk = f.read(BUFFER_SIZE)
+            while chunk:
+                client_socket.send(chunk)
+                chunk = f.read(BUFFER_SIZE)
+            f.close()
+
+        else:
+            if do_cache:
+                print "caching file while serving %s to %s" % (cache_path, str(client_addr))
+                f = open(cache_path, "w+")
+                while len(reply):
+                    client_socket.send(reply)
+                    f.write(reply)
+                    reply = server_socket.recv(BUFFER_SIZE)
+                f.close()
+            else:
+                print "without caching serving %s to %s" % (cache_path, str(client_addr))
+                #print len(reply), reply
+                while len(reply):
+                    client_socket.send(reply)
+                    reply = server_socket.recv(BUFFER_SIZE)
+                    #print len(reply), reply
+
+        server_socket.close()
+        client_socket.close()
+        return
+
+    except Exception as e:
+        server_socket.close()
+        client_socket.close()
+        print e
+        return
+
+
+def serve_post(client_socket, client_addr, details):
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.connect((details["server_url"], details["server_port"]))
         server_socket.send(details["client_data"])
-        print details["client_data"]
 
         while True:
             reply = server_socket.recv(BUFFER_SIZE)
             if len(reply):
                 client_socket.send(reply)
-                #print "data : %s" % reply
             else:
                 break
 
@@ -95,12 +245,27 @@ def serve(client_socket, client_addr, details):
         return
 
 
+
 # A thread function to handle one request
 def handle_one_request_(client_socket, client_addr, client_data):
 
     details = parse_details(client_addr, client_data)
-    if not details:return
-    serve(client_socket, client_addr, details)
+
+    if not details:
+        print "no any details"
+        client_socket.close()
+        return
+
+    if details["method"] == "GET":
+        details = get_cache_details(client_addr, details)
+        if details["last_mtime"]:
+            details = insert_if_modified(details)
+        serve_get(client_socket, client_addr, details)
+
+    elif details["method"] == "POST":
+        serve_post(client_socket, client_addr, details)
+
+    print client_addr, "closed"
 
 
 
@@ -142,8 +307,12 @@ def start_proxy_server():
             thread.start_new_thread(handle_one_request_, (client_socket, client_addr, client_data))
 
         except KeyboardInterrupt:
+            client_socket.close()
             proxy_socket.close()
             print "\nProxy server shutting down ..."
             break
 
+
+logs = {}
+locks = {}
 start_proxy_server()
