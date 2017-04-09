@@ -23,10 +23,84 @@ except:
     raise SystemExit
 
 
+# returns a dictionary of details
+def parse_details(client_addr, client_data):
+    try:
+        lines = client_data.splitlines()
+        first_line_tokens = lines[0].split()
+        url = first_line_tokens[1]
+
+        url_pos = url.find("://")
+        if url_pos != -1:
+            protocol = url[:url_pos]
+            url = url[(url_pos+3):]
+        else:
+            protocol = "http"
+
+        port_pos = url.find(":")
+        path_pos = url.find("/")
+        if path_pos == -1:
+            path_pos = len(url)
+
+
+        if port_pos==-1 or path_pos < port_pos:
+            server_port = 80
+            server_url = url[:path_pos]
+        else:
+            server_port = int(url[(port_pos+1):path_pos])
+            server_url = url[:port_pos]
+
+        first_line_tokens[1] = url[path_pos:]
+        lines[0] = ' '.join(first_line_tokens)
+        client_data = "\r\n".join(lines) + '\r\n\r\n'
+
+        return {
+            "server_port" : server_port,
+            "server_url" : server_url,
+            "client_data" : client_data,
+            "protocol" : protocol,
+        }
+
+    except Exception as e:
+        print e
+        print
+        return None
+
+
+# get the response from server and give it to client
+def serve(client_socket, client_addr, details):
+    try:
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.connect((details["server_url"], details["server_port"]))
+        server_socket.send(details["client_data"])
+        print details["client_data"]
+
+        while True:
+            reply = server_socket.recv(BUFFER_SIZE)
+            if len(reply):
+                client_socket.send(reply)
+            else:
+                break
+
+        server_socket.close()
+        client_socket.close()
+        return
+
+    except Exception as e:
+        server_socket.close()
+        client_socket.close()
+        print e
+        return
+
+
 # A thread function to handle one request
 def handle_one_request_(client_socket, client_addr, client_data):
-    client_socket.send(client_data)
-    client_socket.close()
+
+    details = parse_details(client_addr, client_data)
+    if not details:return
+    serve(client_socket, client_addr, details)
+
+
 
 
 # This funciton initializes socket and starts listening.
@@ -64,8 +138,7 @@ def start_proxy_server():
                 )
 
             thread.start_new_thread(handle_one_request_, (client_socket, client_addr, client_data))
-            # client_socket.send(client_data)
-            # client_socket.close()
+
         except KeyboardInterrupt:
             proxy_socket.close()
             print "\nProxy server shutting down ..."
