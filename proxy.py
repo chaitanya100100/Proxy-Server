@@ -16,6 +16,8 @@ BUFFER_SIZE = 4096
 CACHE_DIR = "./cache"
 BLACKLIST_FILE = "blacklist.txt"
 USERNAME_PASSWORD_FILE = "username_password.txt"
+MAX_CACHE_BUFFER = 3
+NO_OF_OCC_FOR_CACHE = 2
 blocked = []
 admins = []
 
@@ -56,7 +58,8 @@ data = data.splitlines()
 for d in data:
     admins.append(base64.b64encode(d))
 
-print admins
+for file in os.listdir(CACHE_DIR):
+    os.remove(CACHE_DIR + "/" + file)
 
 
 # lock fileurl
@@ -80,6 +83,7 @@ def leave_access(fileurl):
 
 # add fileurl entry to log
 def add_log(fileurl, client_addr):
+    fileurl = fileurl.replace("/", "__")
     if not fileurl in logs:
         logs[fileurl] = []
     dt = time.strptime(time.ctime(), "%a %b %d %H:%M:%S %Y")
@@ -92,9 +96,9 @@ def add_log(fileurl, client_addr):
 # decide whether to cache or not
 def do_cache_or_not(fileurl):
     try:
-        log_arr = logs[fileurl]
-        if len(log_arr) < 3 : return False
-        last_third = log_arr[len(log_arr)-3]["datetime"]
+        log_arr = logs[fileurl.replace("/", "__")]
+        if len(log_arr) < NO_OF_OCC_FOR_CACHE : return False
+        last_third = log_arr[len(log_arr)-NO_OF_OCC_FOR_CACHE]["datetime"]
         if datetime.datetime.fromtimestamp(time.mktime(last_third)) + datetime.timedelta(minutes=10) >= datetime.datetime.now():
             return True
         else:
@@ -116,6 +120,43 @@ def get_current_cache_info(fileurl):
         return cache_path, last_mtime
     else:
         return cache_path, None
+
+
+# collect all cache info
+def get_cache_details(client_addr, details):
+    get_access(details["total_url"])
+    add_log(details["total_url"], client_addr)
+    do_cache = do_cache_or_not(details["total_url"])
+    cache_path, last_mtime = get_current_cache_info(details["total_url"])
+    leave_access(details["total_url"])
+    details["do_cache"] = do_cache
+    details["cache_path"] = cache_path
+    details["last_mtime"] = last_mtime
+    return details
+
+
+# if cache is full then delete the least recently used cache item
+def get_space_for_cache(fileurl):
+    cache_files = os.listdir(CACHE_DIR)
+    if len(cache_files) < MAX_CACHE_BUFFER:
+        return
+    for file in cache_files:
+        get_access(file)
+    """"
+    last_mtime = min(os.path.getmtime(CACHE_DIR + "/" + file) for file in cache_files)
+    print last_mtime
+    file = [file for file in cache_files if os.path.getmtime(CACHE_DIR + "/" + file) == last_mtime][0]
+    print file
+    os.remove(CACHE_DIR + "/" + file)
+    print file, "removed"
+    """
+    last_mtime = min(logs[file][-1]["datetime"] for file in cache_files)
+    file_to_del = [file for file in cache_files if logs[file][-1]["datetime"] == last_mtime][0]
+
+    os.remove(CACHE_DIR + "/" + file_to_del)
+    for file in cache_files:
+        leave_access(file)
+
 
 # returns a dictionary of details
 def parse_details(client_addr, client_data):
@@ -154,7 +195,6 @@ def parse_details(client_addr, client_data):
             server_url = url[:port_pos]
 
         # check for auth
-        print lines
         auth_line = [ line for line in lines if "Authorization" in line]
         if len(auth_line):
             auth_b64 = auth_line[0].split()[2]
@@ -181,17 +221,6 @@ def parse_details(client_addr, client_data):
         print
         return None
 
-# collect all cache info
-def get_cache_details(client_addr, details):
-    get_access(details["total_url"])
-    add_log(details["total_url"], client_addr)
-    do_cache = do_cache_or_not(details["total_url"])
-    cache_path, last_mtime = get_current_cache_info(details["total_url"])
-    leave_access(details["total_url"])
-    details["do_cache"] = do_cache
-    details["cache_path"] = cache_path
-    details["last_mtime"] = last_mtime
-    return details
 
 
 # insert the header
@@ -210,6 +239,7 @@ def insert_if_modified(details):
     return details
 
 
+# serve get request
 def serve_get(client_socket, client_addr, details):
     try:
         #print details["client_data"], details["do_cache"], details["cache_path"], details["last_mtime"]
@@ -225,24 +255,29 @@ def serve_get(client_socket, client_addr, details):
         reply = server_socket.recv(BUFFER_SIZE)
         if last_mtime and "304 Not Modified" in reply:
             print "returning cached file %s to %s" % (cache_path, str(client_addr))
+            get_access(details["total_url"])
             f = open(cache_path, 'rb')
             chunk = f.read(BUFFER_SIZE)
             while chunk:
                 client_socket.send(chunk)
                 chunk = f.read(BUFFER_SIZE)
             f.close()
+            leave_access(details["total_url"])
 
         else:
             if do_cache:
                 print "caching file while serving %s to %s" % (cache_path, str(client_addr))
+                get_space_for_cache(details["total_url"])
+                get_access(details["total_url"])
                 f = open(cache_path, "w+")
-                print len(reply), reply
+                # print len(reply), reply
                 while len(reply):
                     client_socket.send(reply)
                     f.write(reply)
                     reply = server_socket.recv(BUFFER_SIZE)
-                    print len(reply), reply
+                    #print len(reply), reply
                 f.close()
+                leave_access(details["total_url"])
                 client_socket.send("\r\n\r\n")
             else:
                 print "without caching serving %s to %s" % (cache_path, str(client_addr))
@@ -331,6 +366,7 @@ def handle_one_request_(client_socket, client_addr, client_data):
 
     client_socket.close()
     print client_addr, "closed"
+    print
 
 
 
@@ -364,6 +400,7 @@ def start_proxy_server():
             client_socket, client_addr = proxy_socket.accept()
             client_data = client_socket.recv(BUFFER_SIZE)
 
+            print
             print "%s - - [%s] \"%s\"" % (
                 str(client_addr),
                 str(datetime.datetime.now()),
