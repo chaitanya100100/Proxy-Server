@@ -5,7 +5,7 @@ import time
 
 if len(sys.argv) < 4:
     print "Usage: python client.py <CLIENT_PORTS_RANGE> <PROXY_PORT> <END_SERVER_PORT>"
-    print "Example: python client.py 20010 20000 19990-19999"
+    print "Example: python client.py 20001-20010 20000 19990-19999"
     raise SystemExit
 
 CLIENT_PORT = sys.argv[1]

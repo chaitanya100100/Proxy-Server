@@ -346,7 +346,15 @@ def handle_one_request_(client_socket, client_addr, client_data):
         return
 
     isb = is_blocked(client_socket, client_addr, details)
-    print "Block status : ", isb
+
+    """
+        Here we can check whether request is from outside the campus area or not.
+        We have IP and port to which the request is being made.
+        We can send error message if required.
+    """
+
+    if isb:
+        print "Block status : ", isb
 
     if isb:
         client_socket.send("HTTP/1.0 200 OK\r\n")
